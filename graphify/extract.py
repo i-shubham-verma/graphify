@@ -18,6 +18,66 @@ def _make_id(*parts: str) -> str:
     return cleaned.strip("_").lower()
 
 
+def _rel_stem(path: Path, root: Path | None) -> str:
+    """Return a collision-safe stem using the path relative to root."""
+    if root is None:
+        return path.stem
+    try:
+        rel = path.relative_to(root)
+        return re.sub(r"[^a-zA-Z0-9]+", "_", str(rel.with_suffix(""))).strip("_")
+    except ValueError:
+        return path.stem
+
+
+_JS_EXTS: frozenset[str] = frozenset({".js", ".jsx", ".mjs", ".ts", ".tsx", ".vue", ".svelte"})
+
+
+def _discover_js_packages(paths: list[Path]) -> dict[Path, str]:
+    """Scan directories of JS/TS paths for package.json files.
+
+    Returns a map of package_root → package name (from the "name" field).
+    Handles nested packages — each file resolves to its nearest ancestor.
+    """
+    pkg_map: dict[Path, str] = {}
+    visited: set[Path] = set()
+    for path in paths:
+        for parent in path.parents:
+            if parent in visited:
+                break
+            visited.add(parent)
+            pkg_json = parent / "package.json"
+            if pkg_json.exists():
+                try:
+                    data = json.loads(pkg_json.read_text(encoding="utf-8"))
+                    name = data.get("name", "")
+                    if name:
+                        pkg_map[parent] = name
+                except Exception:
+                    pass
+    return pkg_map
+
+
+def _js_pkg_info(path: Path, pkg_map: dict[Path, str] | None) -> tuple[str | None, str | None]:
+    """Return (stem, raw_pkg_name) for a JS/TS file within a known package.
+
+    stem is alphanumeric and collision-safe (pkg_norm + rel_norm).
+    raw_pkg_name preserves the original name from package.json (e.g. '@mb-core/button')
+    for use as a node attribute — it is never embedded in the node ID.
+    Returns (None, None) if the file is not within any known package.
+    """
+    if not pkg_map:
+        return None, None
+    for parent in path.parents:
+        if parent in pkg_map:
+            pkg_name = pkg_map[parent]
+            rel = path.relative_to(parent).with_suffix("")
+            norm_pkg = re.sub(r"[^a-zA-Z0-9]+", "_", pkg_name).strip("_")
+            norm_rel = re.sub(r"[^a-zA-Z0-9]+", "_", str(rel)).strip("_")
+            stem = f"{norm_pkg}_{norm_rel}" if norm_rel else norm_pkg
+            return stem, pkg_name
+    return None, None
+
+
 # ── LanguageConfig dataclass ─────────────────────────────────────────────────
 
 @dataclass
@@ -651,7 +711,7 @@ _SWIFT_CONFIG = LanguageConfig(
 
 # ── Generic extractor ─────────────────────────────────────────────────────────
 
-def _extract_generic(path: Path, config: LanguageConfig) -> dict:
+def _extract_generic(path: Path, config: LanguageConfig, proj_root: Path | None = None, stem_override: str | None = None, pkg_name: str | None = None) -> dict:
     """Generic AST extractor driven by LanguageConfig."""
     try:
         mod = importlib.import_module(config.ts_module)
@@ -676,7 +736,7 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
-    stem = path.stem
+    stem = stem_override if stem_override is not None else _rel_stem(path, proj_root)
     str_path = str(path)
     nodes: list[dict] = []
     edges: list[dict] = []
@@ -687,13 +747,16 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
     def add_node(nid: str, label: str, line: int) -> None:
         if nid not in seen_ids:
             seen_ids.add(nid)
-            nodes.append({
+            node: dict = {
                 "id": nid,
                 "label": label,
                 "file_type": "code",
                 "source_file": str_path,
                 "source_location": f"L{line}",
-            })
+            }
+            if pkg_name:
+                node["package"] = pkg_name
+            nodes.append(node)
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", weight: float = 1.0) -> None:
@@ -1243,7 +1306,7 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
 _RATIONALE_PREFIXES = ("# NOTE:", "# IMPORTANT:", "# HACK:", "# WHY:", "# RATIONALE:", "# TODO:", "# FIXME:")
 
 
-def _extract_python_rationale(path: Path, result: dict) -> None:
+def _extract_python_rationale(path: Path, result: dict, proj_root: Path | None = None) -> None:
     """Post-pass: extract docstrings and rationale comments from Python source.
     Mutates result in-place by appending to result['nodes'] and result['edges'].
     """
@@ -1258,7 +1321,7 @@ def _extract_python_rationale(path: Path, result: dict) -> None:
     except Exception:
         return
 
-    stem = path.stem
+    stem = _rel_stem(path, proj_root)
     str_path = str(path)
     nodes = result["nodes"]
     edges = result["edges"]
@@ -1346,61 +1409,62 @@ def _extract_python_rationale(path: Path, result: dict) -> None:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def extract_python(path: Path) -> dict:
+def extract_python(path: Path, root: Path | None = None) -> dict:
     """Extract classes, functions, and imports from a .py file via tree-sitter AST."""
-    result = _extract_generic(path, _PYTHON_CONFIG)
+    result = _extract_generic(path, _PYTHON_CONFIG, proj_root=root)
     if "error" not in result:
-        _extract_python_rationale(path, result)
+        _extract_python_rationale(path, result, proj_root=root)
     return result
 
 
-def extract_js(path: Path) -> dict:
+def extract_js(path: Path, root: Path | None = None, pkg_map: dict[Path, str] | None = None) -> dict:
     """Extract classes, functions, arrow functions, and imports from a .js/.ts/.tsx file."""
     config = _TS_CONFIG if path.suffix in (".ts", ".tsx") else _JS_CONFIG
-    return _extract_generic(path, config)
+    stem, pkg = _js_pkg_info(path, pkg_map)
+    return _extract_generic(path, config, proj_root=root, stem_override=stem, pkg_name=pkg)
 
 
-def extract_java(path: Path) -> dict:
+def extract_java(path: Path, root: Path | None = None) -> dict:
     """Extract classes, interfaces, methods, constructors, and imports from a .java file."""
-    return _extract_generic(path, _JAVA_CONFIG)
+    return _extract_generic(path, _JAVA_CONFIG, proj_root=root)
 
 
-def extract_c(path: Path) -> dict:
+def extract_c(path: Path, root: Path | None = None) -> dict:
     """Extract functions and includes from a .c/.h file."""
-    return _extract_generic(path, _C_CONFIG)
+    return _extract_generic(path, _C_CONFIG, proj_root=root)
 
 
-def extract_cpp(path: Path) -> dict:
+def extract_cpp(path: Path, root: Path | None = None) -> dict:
     """Extract functions, classes, and includes from a .cpp/.cc/.cxx/.hpp file."""
-    return _extract_generic(path, _CPP_CONFIG)
+    return _extract_generic(path, _CPP_CONFIG, proj_root=root)
 
 
-def extract_ruby(path: Path) -> dict:
+def extract_ruby(path: Path, root: Path | None = None) -> dict:
     """Extract classes, methods, singleton methods, and calls from a .rb file."""
-    return _extract_generic(path, _RUBY_CONFIG)
+    return _extract_generic(path, _RUBY_CONFIG, proj_root=root)
 
 
-def extract_csharp(path: Path) -> dict:
+def extract_csharp(path: Path, root: Path | None = None) -> dict:
     """Extract classes, interfaces, methods, namespaces, and usings from a .cs file."""
-    return _extract_generic(path, _CSHARP_CONFIG)
+    return _extract_generic(path, _CSHARP_CONFIG, proj_root=root)
 
 
-def extract_kotlin(path: Path) -> dict:
+def extract_kotlin(path: Path, root: Path | None = None) -> dict:
     """Extract classes, objects, functions, and imports from a .kt/.kts file."""
-    return _extract_generic(path, _KOTLIN_CONFIG)
+    return _extract_generic(path, _KOTLIN_CONFIG, proj_root=root)
 
 
-def extract_scala(path: Path) -> dict:
+def extract_scala(path: Path, root: Path | None = None) -> dict:
     """Extract classes, objects, functions, and imports from a .scala file."""
-    return _extract_generic(path, _SCALA_CONFIG)
+    return _extract_generic(path, _SCALA_CONFIG, proj_root=root)
 
 
-def extract_php(path: Path) -> dict:
+def extract_php(path: Path, root: Path | None = None) -> dict:
     """Extract classes, functions, methods, namespace uses, and calls from a .php file."""
-    return _extract_generic(path, _PHP_CONFIG)
+    return _extract_generic(path, _PHP_CONFIG, proj_root=root)
 
 
-def extract_blade(path: Path) -> dict:
+def extract_blade(path: Path, root: Path | None = None) -> dict:
     """Extract @include, <livewire:> components, and wire:click bindings from Blade templates."""
     import re
     try:
@@ -1447,7 +1511,7 @@ def extract_blade(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
-def extract_dart(path: Path) -> dict:
+def extract_dart(path: Path, root: Path | None = None) -> dict:
     """Extract classes, mixins, functions, imports, and calls from a .dart file using regex."""
     try:
         src = path.read_text(encoding="utf-8", errors="replace")
@@ -1500,7 +1564,7 @@ def extract_dart(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
-def extract_verilog(path: Path) -> dict:
+def extract_verilog(path: Path, proj_root: Path | None = None) -> dict:
     """Extract modules, functions, tasks, package imports, and instantiations from .v/.sv files."""
     try:
         import tree_sitter_verilog as tsverilog
@@ -1517,7 +1581,7 @@ def extract_verilog(path: Path) -> dict:
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
-    stem = path.stem
+    stem = _rel_stem(path, proj_root)
     str_path = str(path)
     nodes: list[dict] = []
     edges: list[dict] = []
@@ -1604,19 +1668,19 @@ def extract_verilog(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
-def extract_lua(path: Path) -> dict:
+def extract_lua(path: Path, root: Path | None = None) -> dict:
     """Extract functions, methods, require() imports, and calls from a .lua file."""
-    return _extract_generic(path, _LUA_CONFIG)
+    return _extract_generic(path, _LUA_CONFIG, proj_root=root)
 
 
-def extract_swift(path: Path) -> dict:
+def extract_swift(path: Path, root: Path | None = None) -> dict:
     """Extract classes, structs, protocols, functions, imports, and calls from a .swift file."""
-    return _extract_generic(path, _SWIFT_CONFIG)
+    return _extract_generic(path, _SWIFT_CONFIG, proj_root=root)
 
 
 # ── Julia extractor (custom walk) ────────────────────────────────────────────
 
-def extract_julia(path: Path) -> dict:
+def extract_julia(path: Path, proj_root: Path | None = None) -> dict:
     """Extract modules, structs, functions, imports, and calls from a .jl file."""
     try:
         import tree_sitter_julia as tsjulia
@@ -1633,7 +1697,7 @@ def extract_julia(path: Path) -> dict:
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
-    stem = path.stem
+    stem = _rel_stem(path, proj_root)
     str_path = str(path)
     nodes: list[dict] = []
     edges: list[dict] = []
@@ -1828,7 +1892,7 @@ def extract_julia(path: Path) -> dict:
 
 # ── Go extractor (custom walk) ────────────────────────────────────────────────
 
-def extract_go(path: Path) -> dict:
+def extract_go(path: Path, proj_root: Path | None = None) -> dict:
     """Extract functions, methods, type declarations, and imports from a .go file."""
     try:
         import tree_sitter_go as tsgo
@@ -1845,7 +1909,7 @@ def extract_go(path: Path) -> dict:
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
-    stem = path.stem
+    stem = _rel_stem(path, proj_root)
     # Use directory name as package scope so methods on the same type across
     # multiple files in a package share one canonical type node.
     pkg_scope = path.parent.name or stem
@@ -1949,13 +2013,17 @@ def extract_go(path: Path) -> dict:
                                 raw = _read_text(path_node, source).strip('"')
                                 # Prefix with go_pkg_ so stdlib names (e.g. "context")
                                 # don't collide with local files of the same basename.
-                                tgt_nid = _make_id("go", "pkg", raw)
+                                # tgt_nid = _make_id("go", "pkg", raw)
+                                module_name = raw.split("/")[-1]
+                                tgt_nid = _make_id(module_name)
                                 add_edge(file_nid, tgt_nid, "imports_from", spec.start_point[0] + 1)
                 elif child.type == "import_spec":
                     path_node = child.child_by_field_name("path")
                     if path_node:
                         raw = _read_text(path_node, source).strip('"')
-                        tgt_nid = _make_id("go", "pkg", raw)
+                        # tgt_nid = _make_id("go", "pkg", raw)
+                        module_name = raw.split("/")[-1]
+                        tgt_nid = _make_id(module_name)
                         add_edge(file_nid, tgt_nid, "imports_from", child.start_point[0] + 1)
             return
 
@@ -2027,7 +2095,7 @@ def extract_go(path: Path) -> dict:
 
 # ── Rust extractor (custom walk) ──────────────────────────────────────────────
 
-def extract_rust(path: Path) -> dict:
+def extract_rust(path: Path, proj_root: Path | None = None) -> dict:
     """Extract functions, structs, enums, traits, impl methods, and use declarations from a .rs file."""
     try:
         import tree_sitter_rust as tsrust
@@ -2044,7 +2112,7 @@ def extract_rust(path: Path) -> dict:
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
-    stem = path.stem
+    stem = _rel_stem(path, proj_root)
     str_path = str(path)
     nodes: list[dict] = []
     edges: list[dict] = []
@@ -2204,7 +2272,7 @@ def extract_rust(path: Path) -> dict:
 
 # ── Zig ───────────────────────────────────────────────────────────────────────
 
-def extract_zig(path: Path) -> dict:
+def extract_zig(path: Path, proj_root: Path | None = None) -> dict:
     """Extract functions, structs, enums, unions, and imports from a .zig file."""
     try:
         import tree_sitter_zig as tszig
@@ -2221,7 +2289,7 @@ def extract_zig(path: Path) -> dict:
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
-    stem = path.stem
+    stem = _rel_stem(path, proj_root)
     str_path = str(path)
     nodes: list[dict] = []
     edges: list[dict] = []
@@ -2367,7 +2435,7 @@ def extract_zig(path: Path) -> dict:
 
 # ── PowerShell ────────────────────────────────────────────────────────────────
 
-def extract_powershell(path: Path) -> dict:
+def extract_powershell(path: Path, proj_root: Path | None = None) -> dict:
     """Extract functions, classes, methods, and using statements from a .ps1 file."""
     try:
         import tree_sitter_powershell as tsps
@@ -2384,7 +2452,7 @@ def extract_powershell(path: Path) -> dict:
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
-    stem = path.stem
+    stem = _rel_stem(path, proj_root)
     str_path = str(path)
     nodes: list[dict] = []
     edges: list[dict] = []
@@ -2586,7 +2654,7 @@ def _resolve_cross_file_imports(
             n["id"] for n in file_result.get("nodes", [])
             if n.get("source_file") == str_path
             and not n["label"].endswith((")", ".py"))
-            and n["id"] != _make_id(stem)  # exclude file-level node
+            and n["id"] != _make_id(str(path))  # exclude file-level node
         ]
         if not local_classes:
             continue
@@ -2664,7 +2732,7 @@ def _resolve_cross_file_imports(
     return new_edges
 
 
-def extract_objc(path: Path) -> dict:
+def extract_objc(path: Path, proj_root: Path | None = None) -> dict:
     """Extract interfaces, implementations, protocols, methods, and imports from .m/.mm/.h files."""
     try:
         import tree_sitter_objc as tsobjc
@@ -2681,7 +2749,7 @@ def extract_objc(path: Path) -> dict:
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
-    stem = path.stem
+    stem = _rel_stem(path, proj_root)
     str_path = str(path)
     nodes: list[dict] = []
     edges: list[dict] = []
@@ -2862,7 +2930,7 @@ def extract_objc(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges, "input_tokens": 0, "output_tokens": 0}
 
 
-def extract_elixir(path: Path) -> dict:
+def extract_elixir(path: Path, proj_root: Path | None = None) -> dict:
     """Extract modules, functions, imports, and calls from a .ex/.exs file."""
     try:
         import tree_sitter_elixir as tselixir
@@ -2879,7 +2947,7 @@ def extract_elixir(path: Path) -> dict:
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
-    stem = path.stem
+    stem = _rel_stem(path, proj_root)
     str_path = str(path)
     nodes: list[dict] = []
     edges: list[dict] = []
@@ -3139,6 +3207,9 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
         ".sv": extract_verilog,
     }
 
+    js_paths = [p for p in paths if p.suffix in _JS_EXTS]
+    js_pkg_map = _discover_js_packages(js_paths) if js_paths else {}
+
     total = len(paths)
     _PROGRESS_INTERVAL = 100
     for i, path in enumerate(paths):
@@ -3155,7 +3226,10 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
         if cached is not None:
             per_file.append(cached)
             continue
-        result = extractor(path)
+        if path.suffix in _JS_EXTS:
+            result = extract_js(path, root, js_pkg_map)
+        else:
+            result = extractor(path, root)
         if "error" not in result:
             save_cached(path, result, cache_root or root)
         per_file.append(result)
